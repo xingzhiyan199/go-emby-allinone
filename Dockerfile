@@ -13,7 +13,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MEDIA_ROOTS=/media
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates wget ffmpeg python3 tzdata libvips42 \
+        ca-certificates wget ffmpeg python3 tzdata libvips42 tini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=src /usr/local/bin/go-emby /usr/local/bin/go-emby
@@ -29,4 +29,4 @@ EXPOSE 8097
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=6 \
     CMD wget -q -O /dev/null http://127.0.0.1:8097/health || exit 1
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]

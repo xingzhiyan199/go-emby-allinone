@@ -36,7 +36,7 @@ fi
 # ---------- 2. 启动 PostgreSQL ----------
 log "启动 postgres (port=$PGPORT)"
 if ! gosu postgres pg_ctl -D "$PGDATA" \
-      -o "-c listen_addresses=127.0.0.1 -p $PGPORT -c max_connections=80 -c shared_buffers=192MB -c work_mem=8MB" \
+      -o "-c listen_addresses=127.0.0.1 -p $PGPORT -c max_connections=30 -c shared_buffers=128MB -c work_mem=4MB -c maintenance_work_mem=64MB" \
       -l /data/pg.log -w -t 60 start; then
   log "!! postgres 启动失败"; tail -30 /data/pg.log; exit 1
 fi
@@ -89,16 +89,31 @@ chmod 644 /run/license-machine-id
 
 # ---------- 5. 后台生成 STRM（可选）----------
 if [ "$STRM_SYNC" = "1" ] && [ -n "${OL_PASS:-}" ]; then
-  log "启动 STRM 同步（源 ${STRM_SRC:-/115} → $MEDIA_DIR/strm）"
+  log "启动 STRM 同步（源 ${STRM_SRC:-AUTO} → $MEDIA_DIR/strm）"
   (
+    FAIL=0
     while true; do
+      START=$(date +%s)
       STRM_OUT="$MEDIA_DIR/strm" /usr/local/bin/gen_strm.py 2>&1 | sed -u 's/^/[strm] /'
-      log "本轮 STRM 结束，${STRM_INTERVAL}s 后再跑"
-      sleep "$STRM_INTERVAL"
+      RC=${PIPESTATUS[0]}
+      RAN=$(( $(date +%s) - START ))
+      # 跑太短又报错 → 判定为异常，退避，避免疯狂刷日志/打爆 API
+      if [ "$RC" -ne 0 ] && [ "$RAN" -lt 60 ]; then
+        FAIL=$((FAIL + 1))
+        WAIT=$(( FAIL > 5 ? 300 : 30 * FAIL ))
+        log "STRM 本轮异常退出 rc=$RC 用时 ${RAN}s，第 ${FAIL} 次，${WAIT}s 后重试"
+      else
+        FAIL=0
+        WAIT="$STRM_INTERVAL"
+        log "本轮 STRM 结束 rc=$RC，${WAIT}s 后再跑"
+      fi
+      sleep "$WAIT"
     done
   ) &
+  STRM_PID=$!
 else
   log "STRM 同步未启用（STRM_SYNC=$STRM_SYNC）"
+  STRM_PID=""
 fi
 
 # ---------- 6. 启动 go-emby ----------
@@ -109,22 +124,66 @@ export MEDIA_INFO_ROOT="$APP_DATA"
 export FILE_MANAGER_ROOT="/media"
 export MEDIA_ROOTS="/media"
 export ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
+# 让 Go 运行时对内存更保守，降低被平台 cgroup OOM 整容器杀掉（表现为 502）的概率
+export GOMEMLIMIT="${GOMEMLIMIT:-1600MiB}"
+export GOGC="${GOGC:-50}"
 
-log "启动 go-emby（license=$([ -n "${LICENSE_KEY:-}" ] && echo 'key set' || echo 'free mode')）"
-/usr/local/bin/go-emby &
-APP_PID=$!
+CRASH=0
+RESTART_MIN="${RESTART_MIN:-5}"
 
 shutdown() {
   log "收到停止信号，关闭服务"
-  kill -TERM "$APP_PID" 2>/dev/null || true
+  trap - TERM INT
+  [ -n "${APP_PID:-}" ] && kill -TERM "$APP_PID" 2>/dev/null || true
+  [ -n "${PG_GUARD_PID:-}" ] && kill -TERM "$PG_GUARD_PID" 2>/dev/null || true
+  [ -n "${STRM_PID:-}" ] && kill -TERM "$STRM_PID" 2>/dev/null || true
   sleep 2
   gosu postgres pg_ctl -D "$PGDATA" -m fast stop >/dev/null 2>&1 || true
   exit 0
 }
 trap shutdown TERM INT
 
-wait "$APP_PID"
-CODE=$?
-log "go-emby 退出，code=$CODE"
-gosu postgres pg_ctl -D "$PGDATA" -m fast stop >/dev/null 2>&1 || true
-exit "$CODE"
+# ---------- 7. PostgreSQL 守护 ----------
+(
+  while true; do
+    sleep 15
+    if ! pg_isready -h 127.0.0.1 -p "$PGPORT" -q 2>/dev/null; then
+      log "!! postgres 无响应，尝试原地拉起"
+      gosu postgres pg_ctl -D "$PGDATA" -m immediate -l /data/pg.log -w -t 60 restart >/dev/null 2>&1 \
+        || gosu postgres pg_ctl -D "$PGDATA" -l /data/pg.log -w -t 60 start >/dev/null 2>&1 \
+        || log "!! postgres 拉起失败"
+      # 让 go-emby 断开重连，避免连接池全是死连接
+      [ -n "${APP_PID:-}" ] && kill -TERM "$APP_PID" 2>/dev/null || true
+    fi
+  done
+) &
+PG_GUARD_PID=$!
+
+# ---------- 8. go-emby 守护循环 ----------
+# 进程自己崩了就地拉起（几秒），不必等平台重启整个容器（60~90s + 重扫库）
+while true; do
+  START_TS=$(date +%s)
+  log "启动 go-emby（license=$([ -n "${LICENSE_KEY:-}" ] && echo 'key set' || echo 'free mode')）"
+  /usr/local/bin/go-emby &
+  APP_PID=$!
+  wait "$APP_PID"
+  CODE=$?
+  UP=$(( $(date +%s) - START_TS ))
+  log "go-emby 退出 code=$CODE 存活 ${UP}s"
+
+  # 存活不足 60 秒视为崩溃；连续 8 次说明不是偶发，交给平台整容器重启
+  if [ "$UP" -lt 60 ]; then
+    CRASH=$((CRASH + 1))
+  else
+    CRASH=0
+  fi
+  if [ "$CRASH" -ge 8 ]; then
+    log "!! go-emby 连续 ${CRASH} 次快速崩溃，交还平台重启容器"
+    gosu postgres pg_ctl -D "$PGDATA" -m fast stop >/dev/null 2>&1 || true
+    exit 1
+  fi
+  DELAY=$(( RESTART_MIN * (CRASH > 3 ? CRASH : 1) ))
+  [ "$DELAY" -gt 60 ] && DELAY=60
+  log "  ${DELAY}s 后重启 go-emby"
+  sleep "$DELAY"
+done
