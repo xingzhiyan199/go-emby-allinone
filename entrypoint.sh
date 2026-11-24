@@ -55,6 +55,26 @@ if ! psql -h 127.0.0.1 -p "$PGPORT" -U postgres -tAc \
     -c "CREATE DATABASE $DB_NAME OWNER $DB_USER" || log "!! 创建数据库失败"
 fi
 
+# ---------- 3.5 重置管理员密码（可选，幂等） ----------
+# 用法：-e ADMIN_PASSWORD=明文 -e ADMIN_PASSWORD_HASH='$2a$12$...'
+# 只在 users 表已存在且能匹配到 admin 时生效；首次启动由 go-emby 自己用 ADMIN_PASSWORD 建号。
+if [ -n "${ADMIN_PASSWORD_HASH:-}" ]; then
+  if psql -h 127.0.0.1 -p "$PGPORT" -U postgres -d "$DB_NAME" -tAc \
+        "SELECT 1 FROM information_schema.tables WHERE table_name='users'" 2>/dev/null | grep -q 1; then
+    N=$(psql -h 127.0.0.1 -p "$PGPORT" -U postgres -d "$DB_NAME" -tAc \
+        "SELECT count(*) FROM users" 2>/dev/null | tr -d ' ')
+    if [ "${N:-0}" -gt 0 ]; then
+      psql -h 127.0.0.1 -p "$PGPORT" -U postgres -d "$DB_NAME" -q -v ON_ERROR_STOP=1 \
+        -c "UPDATE users SET password='${ADMIN_PASSWORD_HASH}' WHERE username='admin'" >/dev/null 2>&1 \
+        && log "已重置 admin 密码（users=$N）" || log "!! 重置 admin 密码失败"
+    else
+      log "users 表为空，交由 go-emby 用 ADMIN_PASSWORD 建号"
+    fi
+  else
+    log "users 表尚未创建，跳过密码重置"
+  fi
+fi
+
 # ---------- 4. 生成并持久化授权机器标识 ----------
 if [ ! -s /data/machine-id ]; then
   head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > /data/machine-id
