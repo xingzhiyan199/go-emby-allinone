@@ -121,8 +121,10 @@ export DATABASE_URL="postgres://$DB_USER:$DB_PASS@127.0.0.1:$PGPORT/$DB_NAME?ssl
 export LICENSE_KEY="${LICENSE_KEY:-}"
 export LICENSE_SERVER_URL="${LICENSE_SERVER_URL:-https://tl.macacaaca.top}"
 export MEDIA_INFO_ROOT="$APP_DATA"
-export FILE_MANAGER_ROOT="/media"
-export MEDIA_ROOTS="/media"
+# go-emby 遍历媒体目录时不跟随软链，必须给它真实路径 /data/media，
+# /media 只作为兼容用的软链保留，不能作为 MEDIA_ROOTS（否则扫库结果为 0）。
+export FILE_MANAGER_ROOT="${MEDIA_DIR}"
+export MEDIA_ROOTS="${MEDIA_ROOTS:-$MEDIA_DIR}"
 export ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 # 让 Go 运行时对内存更保守，降低被平台 cgroup OOM 整容器杀掉（表现为 502）的概率
 export GOMEMLIMIT="${GOMEMLIMIT:-1600MiB}"
