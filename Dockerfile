@@ -13,7 +13,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MEDIA_ROOTS=/media
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates wget ffmpeg python3 tzdata \
+        ca-certificates wget ffmpeg python3 tzdata libvips42 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=src /usr/local/bin/go-emby /usr/local/bin/go-emby
