@@ -87,7 +87,7 @@ export MEDIA_ROOTS="/media"
 export ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 
 log "启动 go-emby（license=$([ -n "${LICENSE_KEY:-}" ] && echo 'key set' || echo 'free mode')）"
-/app/go-emby &
+/usr/local/bin/go-emby &
 APP_PID=$!
 
 shutdown() {

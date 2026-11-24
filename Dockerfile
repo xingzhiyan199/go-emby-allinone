@@ -16,11 +16,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates wget ffmpeg python3 tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=src /app/go-emby /app/go-emby
+COPY --from=src /usr/local/bin/go-emby /usr/local/bin/go-emby
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY gen_strm.py /usr/local/bin/gen_strm.py
 
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/gen_strm.py /app/go-emby \
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/gen_strm.py /usr/local/bin/go-emby \
     && mkdir -p /app/data /app/backups /media /data/pg /data/media/strm /data/app /data/backups /run/bootstrap \
     && chown -R postgres:postgres /data/pg
 
