@@ -35,10 +35,32 @@ fi
 
 # ---------- 2. 启动 PostgreSQL ----------
 log "启动 postgres (port=$PGPORT)"
-if ! gosu postgres pg_ctl -D "$PGDATA" \
-      -o "-c listen_addresses=127.0.0.1 -p $PGPORT -c max_connections=30 -c shared_buffers=128MB -c work_mem=4MB -c maintenance_work_mem=64MB" \
-      -l /data/pg.log -w -t 60 start; then
-  log "!! postgres 启动失败"; tail -30 /data/pg.log; exit 1
+# 上次被平台强杀（SIGKILL）会残留 postmaster.pid，导致 pg_ctl 误判"已在运行"或起不来。
+if [ -f "$PGDATA/postmaster.pid" ]; then
+  if pg_isready -h 127.0.0.1 -p "$PGPORT" -q 2>/dev/null; then
+    log "postgres 已在运行，跳过启动"
+  else
+    log "清理残留 postmaster.pid"
+    rm -f "$PGDATA/postmaster.pid"
+  fi
+fi
+# 崩溃恢复时 PG 要做全量 fsync，节点存储慢时单次可达 60s 以上。
+# 原来 -t 60 会在恢复完成前超时，entrypoint 据此 exit 1，容器被平台判为启动失败，
+# 表现为「部署成功但一直 502」。这里放宽到 300s 并重试两次。
+PG_OK=0
+for attempt in 1 2; do
+  if gosu postgres pg_ctl -D "$PGDATA" \
+        -o "-c listen_addresses=127.0.0.1 -p $PGPORT -c max_connections=30 -c shared_buffers=128MB -c work_mem=4MB -c maintenance_work_mem=64MB" \
+        -l /data/pg.log -w -t 300 start; then
+    PG_OK=1; break
+  fi
+  log "!! postgres 第 $attempt 次启动未成功，8s 后重试"
+  tail -20 /data/pg.log
+  rm -f "$PGDATA/postmaster.pid"
+  sleep 8
+done
+if [ "$PG_OK" != "1" ]; then
+  log "!! postgres 启动失败，放弃"; tail -40 /data/pg.log; exit 1
 fi
 
 # ---------- 3. 确保角色与数据库存在 ----------
@@ -54,6 +76,10 @@ if ! psql -h 127.0.0.1 -p "$PGPORT" -U postgres -tAc \
   psql -h 127.0.0.1 -p "$PGPORT" -U postgres -q \
     -c "CREATE DATABASE $DB_NAME OWNER $DB_USER" || log "!! 创建数据库失败"
 fi
+# go-emby 的统计任务会 SET temp_file_limit 等 PG 参数，普通角色没有权限会报
+# permission denied to set parameter，导致媒体库大小/统计一直为空。给业务角色超级用户。
+psql -h 127.0.0.1 -p "$PGPORT" -U postgres -q \
+  -c "ALTER ROLE $DB_USER SUPERUSER" 2>/dev/null || log "!! 提升 $DB_USER 权限失败（可忽略）"
 
 # ---------- 3.5 重置管理员密码（可选，幂等） ----------
 # 用法：-e ADMIN_PASSWORD=明文 -e ADMIN_PASSWORD_HASH='$2a$12$...'
@@ -151,8 +177,9 @@ trap shutdown TERM INT
     sleep 15
     if ! pg_isready -h 127.0.0.1 -p "$PGPORT" -q 2>/dev/null; then
       log "!! postgres 无响应，尝试原地拉起"
-      gosu postgres pg_ctl -D "$PGDATA" -m immediate -l /data/pg.log -w -t 60 restart >/dev/null 2>&1 \
-        || gosu postgres pg_ctl -D "$PGDATA" -l /data/pg.log -w -t 60 start >/dev/null 2>&1 \
+      rm -f "$PGDATA/postmaster.pid"
+      gosu postgres pg_ctl -D "$PGDATA" -m immediate -l /data/pg.log -w -t 300 restart >/dev/null 2>&1 \
+        || gosu postgres pg_ctl -D "$PGDATA" -l /data/pg.log -w -t 300 start >/dev/null 2>&1 \
         || log "!! postgres 拉起失败"
       # 让 go-emby 断开重连，避免连接池全是死连接
       [ -n "${APP_PID:-}" ] && kill -TERM "$APP_PID" 2>/dev/null || true
