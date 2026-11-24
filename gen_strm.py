@@ -18,6 +18,9 @@ OpenList -> STRM 生成器（并发版）
   STRM_WORKERS 并发线程数           (默认 6)
   STRM_DELAY  每次请求之间的延时秒数 (默认 0.2)
   STRM_PAGE   分页大小             (默认 200)
+  STRM_EXCLUDE 跳过不扫的目录，逗号分隔的前缀，例如 /3998/手机图片,/3998/同步盘
+  STRM_TIMEOUT 单次请求超时秒数     (默认 25)
+  STRM_TRIES  单个请求最多尝试次数  (默认 2)
 """
 import json
 import os
@@ -41,6 +44,19 @@ FORCE = os.environ.get("STRM_FORCE", "0") == "1"
 PRUNE = os.environ.get("STRM_PRUNE", "1") == "1"
 PAGE_SIZE = int(os.environ.get("STRM_PAGE", "200"))
 WORKERS = max(1, int(os.environ.get("STRM_WORKERS", "6")))
+TIMEOUT = float(os.environ.get("STRM_TIMEOUT", "25"))
+TRIES = max(1, int(os.environ.get("STRM_TRIES", "2")))
+EXCLUDE = [e.strip().rstrip("/") for e in
+           (os.environ.get("STRM_EXCLUDE", "") or "").split(",") if e.strip()]
+
+
+def excluded(path):
+    """路径命中排除前缀则返回 True（按路径段匹配，避免 /a/b 误伤 /a/bc）"""
+    p = path.rstrip("/")
+    for e in EXCLUDE:
+        if p == e or p.startswith(e + "/"):
+            return True
+    return False
 
 VIDEO_EXT = {
     ".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".wmv", ".flv",
@@ -49,7 +65,7 @@ VIDEO_EXT = {
 }
 
 STAT = {"dirs": 0, "files": 0, "total": 0, "strm": 0, "skip": 0, "fast": 0,
-        "err": 0, "pruned": 0, "rmdir": 0}
+        "err": 0, "pruned": 0, "rmdir": 0, "excl": 0}
 EXPECTED = set()
 BAD_DIRS = set()
 SRC_BAD = 0
@@ -66,11 +82,11 @@ def bump(key, n=1):
         STAT[key] = STAT.get(key, 0) + n
 
 
-def call(path, body=None, token=None, tries=3):
+def call(path, body=None, token=None, tries=None):
     url = BASE + path
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
     last = None
-    for n in range(tries):
+    for n in range(tries or TRIES):
         try:
             req = urllib.request.Request(url, data=data, method="POST" if data is not None else "GET")
             req.add_header("User-Agent", UA)
@@ -79,7 +95,7 @@ def call(path, body=None, token=None, tries=3):
                 req.add_header("Content-Type", "application/json")
             if token:
                 req.add_header("Authorization", token)
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
                 out = json.loads(r.read().decode("utf-8", "replace"))
             if DELAY > 0:
                 time.sleep(DELAY)
@@ -189,6 +205,8 @@ def crawl(token, src, out_root, pool):
     files = []
     stack = [(src, out_root, True)]
     pending = {}
+    scanned = 0
+    skipped = 0
     while stack or pending:
         while stack:
             p, o, top = stack.pop()
@@ -198,6 +216,7 @@ def crawl(token, src, out_root, pool):
         done, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
         for f in done:
             p, o, top = pending.pop(f)
+            scanned += 1
             try:
                 items, err = f.result()
             except Exception as e:
@@ -216,12 +235,22 @@ def crawl(token, src, out_root, pool):
                     continue
                 child = p.rstrip("/") + "/" + name
                 if it.get("is_dir"):
+                    if excluded(child):
+                        skipped += 1
+                        bump("excl")
+                        continue
                     bump("dirs")
                     stack.append((child, os.path.join(o, name), False))
                 else:
                     ext = os.path.splitext(name)[1].lower()
                     if ext in VIDEO_EXT:
                         files.append((child, os.path.join(o, os.path.splitext(name)[0])))
+            # 爬树阶段原本完全静默，大库跑几十分钟看不到进展，这里每 100 个目录报一次
+            if scanned % 100 == 0:
+                log("  扫描中: 已列 %d 目录 | 发现 %d 视频 | 待列 %d | 已排除 %d"
+                    % (scanned, len(files), len(pending) + len(stack), skipped))
+    if skipped:
+        log("  已按 STRM_EXCLUDE 跳过 %d 个目录" % skipped)
     return files
 
 
@@ -302,6 +331,8 @@ def main():
     log("=== STRM 生成开始 ===")
     log("配置源: %s  ->  输出: %s  (force=%s, prune=%s, workers=%d)" % (
         SRC_RAW, OUT, FORCE, PRUNE, WORKERS))
+    if EXCLUDE:
+        log("排除目录: %s" % ", ".join(EXCLUDE))
     token = login()
     srcs = resolve_sources(token)
     if not srcs:
@@ -326,9 +357,9 @@ def main():
         pool.shutdown(wait=True)
 
     log("=== 完成 ===")
-    log("目录 %d | 视频文件 %d | 生成 %d | 跳过 %d (免查 %d) | 失败 %d | 耗时 %.1fs" % (
+    log("目录 %d | 视频文件 %d | 生成 %d | 跳过 %d (免查 %d) | 失败 %d | 排除 %d | 耗时 %.1fs" % (
         STAT["dirs"], STAT["files"], STAT["strm"], STAT["skip"], STAT["fast"],
-        STAT["err"], time.time() - t0))
+        STAT["err"], STAT["excl"], time.time() - t0))
 
     if PRUNE:
         if SRC_BAD > 0:
