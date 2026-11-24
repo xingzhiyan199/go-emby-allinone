@@ -10,6 +10,7 @@ OpenList -> STRM 生成器
   OL_PASS    密码                 (必填)
   STRM_SRC   OpenList 内的源路径  (默认 /115)
              支持多个，逗号分隔，例如: /移动/探花合集,/移动/2026精点
+             设为 AUTO 则自动使用 OpenList 里所有状态正常的挂载点（改挂载名不用改配置）
   STRM_OUT   输出目录             (默认 /data/strm)
   STRM_FORCE 1=覆盖已存在文件     (默认 0，增量模式：内容相同则跳过)
   STRM_PRUNE 1=删除本轮未出现的旧 .strm 及空目录 (默认 1)
@@ -92,6 +93,27 @@ def login():
         raise SystemExit("登录失败: %s" % d)
     log("登录成功:", USER)
     return d["data"]["token"]
+
+
+def resolve_sources(token):
+    """STRM_SRC=AUTO 时，自动取 OpenList 里所有状态正常的挂载点作为源。"""
+    if SRC_RAW.strip().upper() != "AUTO":
+        return SRCS
+    d = call("/api/admin/storage/list?page=1&per_page=100", None, token)
+    if d.get("code") != 200:
+        log("!! 读取挂载列表失败: %s，回退到显式源" % d.get("message"))
+        return SRCS if SRCS != ["AUTO"] else ["/"]
+    found = []
+    for s in ((d.get("data") or {}).get("content") or []):
+        mp = s.get("mount_path") or ""
+        st = s.get("status") or ""
+        log("  发现挂载: %s (%s, status=%s)" % (mp, s.get("driver"), st))
+        if mp and st == "work":
+            found.append(mp.rstrip("/") or "/")
+    if not found:
+        log("!! 没有可用的挂载点")
+        return []
+    return found
 
 
 def build_url(path, sign):
@@ -241,11 +263,17 @@ def main():
     if not PASS:
         raise SystemExit("缺少 OL_PASS")
     log("=== STRM 生成开始 ===")
-    log("源: %s  ->  输出: %s  (force=%s, prune=%s)" % (", ".join(SRCS), OUT, FORCE, PRUNE))
+    log("配置源: %s  ->  输出: %s  (force=%s, prune=%s)" % (SRC_RAW, OUT, FORCE, PRUNE))
     token = login()
+    srcs = resolve_sources(token)
+    if not srcs:
+        log("!! 无可用源，退出")
+        return
+    if len(srcs) > 1 or srcs[0] != SRC_RAW:
+        log("实际源: %s" % ", ".join(srcs))
     os.makedirs(OUT, exist_ok=True)
     t0 = time.time()
-    for i, src in enumerate(SRCS):
+    for i, src in enumerate(srcs):
         if i:
             log("--- 切换到下一个源: %s" % src)
         walk(token, src, OUT, top=True)
