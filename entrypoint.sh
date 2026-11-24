@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # 单容器内同时运行 PostgreSQL 17 与 go-emby，并可选地在后台生成 STRM
+# 所有持久化数据都放在 /data（Altare Docker App 的持久卷挂载点）
 set -uo pipefail
 
 log() { echo "[entry $(date '+%H:%M:%S')] $*"; }
 
 PGDATA="${PGDATA:-/data/pg}"
-APP_DATA=/app/data
-MEDIA_DIR=/media
+APP_DATA="${APP_DATA:-/data/app}"
+MEDIA_DIR="${MEDIA_DIR:-/data/media}"
 DB_NAME="${DB_NAME:-emby}"
 DB_USER="${DB_USER:-emby}"
 DB_PASS="${DB_PASS:-emby_local_pw}"
@@ -14,7 +15,10 @@ PGPORT="${PGPORT:-5432}"
 STRM_SYNC="${STRM_SYNC:-1}"
 STRM_INTERVAL="${STRM_INTERVAL:-21600}"
 
-mkdir -p "$PGDATA" "$APP_DATA" /app/backups "$MEDIA_DIR/strm" /run/bootstrap
+# 固定路径映射到持久卷
+mkdir -p "$PGDATA" "$APP_DATA" /data/backups "$MEDIA_DIR/strm" /run/bootstrap
+ln -sfn "$MEDIA_DIR" /media
+ln -sfn /data/backups /app/backups
 chown -R postgres:postgres "$PGDATA" 2>/dev/null || true
 
 # ---------- 1. 初始化数据库集群 ----------
@@ -38,15 +42,16 @@ if ! gosu postgres pg_ctl -D "$PGDATA" \
 fi
 
 # ---------- 3. 确保角色与数据库存在 ----------
-PSQL="psql -h 127.0.0.1 -p $PGPORT -U postgres -tAc"
-if ! $PSQL "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'" | grep -q 1; then
+if ! psql -h 127.0.0.1 -p "$PGPORT" -U postgres -tAc \
+      "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'" | grep -q 1; then
   log "创建角色 $DB_USER"
-  psql -h 127.0.0.1 -p $PGPORT -U postgres -q \
+  psql -h 127.0.0.1 -p "$PGPORT" -U postgres -q \
     -c "CREATE ROLE $DB_USER LOGIN PASSWORD '$DB_PASS'" || log "!! 创建角色失败"
 fi
-if ! $PSQL "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" | grep -q 1; then
+if ! psql -h 127.0.0.1 -p "$PGPORT" -U postgres -tAc \
+      "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" | grep -q 1; then
   log "创建数据库 $DB_NAME"
-  psql -h 127.0.0.1 -p $PGPORT -U postgres -q \
+  psql -h 127.0.0.1 -p "$PGPORT" -U postgres -q \
     -c "CREATE DATABASE $DB_NAME OWNER $DB_USER" || log "!! 创建数据库失败"
 fi
 
@@ -69,7 +74,7 @@ if [ "$STRM_SYNC" = "1" ] && [ -n "${OL_PASS:-}" ]; then
     done
   ) &
 else
-  log "STRM 同步未启用（STRM_SYNC=$STRM_SYNC, OL_PASS 是否为空=$([ -z "${OL_PASS:-}" ] && echo yes || echo no)）"
+  log "STRM 同步未启用（STRM_SYNC=$STRM_SYNC）"
 fi
 
 # ---------- 6. 启动 go-emby ----------
@@ -77,8 +82,8 @@ export DATABASE_URL="postgres://$DB_USER:$DB_PASS@127.0.0.1:$PGPORT/$DB_NAME?ssl
 export LICENSE_KEY="${LICENSE_KEY:-}"
 export LICENSE_SERVER_URL="${LICENSE_SERVER_URL:-https://tl.macacaaca.top}"
 export MEDIA_INFO_ROOT="$APP_DATA"
-export FILE_MANAGER_ROOT="$MEDIA_DIR"
-export MEDIA_ROOTS="$MEDIA_DIR"
+export FILE_MANAGER_ROOT="/media"
+export MEDIA_ROOTS="/media"
 export ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 
 log "启动 go-emby（license=$([ -n "${LICENSE_KEY:-}" ] && echo 'key set' || echo 'free mode')）"

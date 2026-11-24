@@ -21,7 +21,7 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY gen_strm.py /usr/local/bin/gen_strm.py
 
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/gen_strm.py /app/go-emby \
-    && mkdir -p /app/data /app/backups /media/strm /data/pg /run/bootstrap \
+    && mkdir -p /app/data /app/backups /media /data/pg /data/media/strm /data/app /data/backups /run/bootstrap \
     && chown -R postgres:postgres /data/pg
 
 EXPOSE 8097
