@@ -2,15 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 OpenList -> STRM 生成器
-遍历 OpenList 某个挂载目录，为每个视频文件生成 .strm（内含带 sign 的 302 直链）。
+遍历 OpenList 某个（或多个）挂载目录，为每个视频文件生成 .strm（内含带 sign 的 302 直链）。
 
 环境变量:
   OL_URL     OpenList 地址        (默认 https://openlist.go.altare.global)
   OL_USER    账号                 (默认 admin)
   OL_PASS    密码                 (必填)
   STRM_SRC   OpenList 内的源路径  (默认 /115)
+             支持多个，逗号分隔，例如: /移动/探花合集,/移动/2026精点
   STRM_OUT   输出目录             (默认 /data/strm)
-  STRM_FORCE 1=覆盖已存在文件     (默认 0，增量模式)
+  STRM_FORCE 1=覆盖已存在文件     (默认 0，增量模式：内容相同则跳过)
+  STRM_PRUNE 1=删除本轮未出现的旧 .strm 及空目录 (默认 1)
+             仅当所有源都成功遍历（无任何列目录失败）时才会执行，避免限流误删
+  STRM_DELAY 每次请求之间的延时秒数 (默认 0.2)
+  STRM_PAGE  分页大小             (默认 200)
 """
 import json
 import os
@@ -25,9 +30,11 @@ USER = os.environ.get("OL_USER", "admin")
 PASS = os.environ.get("OL_PASS", "")
 UA = os.environ.get("OL_UA", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 DELAY = float(os.environ.get("STRM_DELAY", "0.2"))
-SRC = (os.environ.get("STRM_SRC", "/115") or "/115").rstrip("/")
+SRC_RAW = os.environ.get("STRM_SRC", "/115") or "/115"
+SRCS = [s.strip().rstrip("/") or "/" for s in SRC_RAW.split(",") if s.strip()]
 OUT = os.environ.get("STRM_OUT", "/data/strm")
 FORCE = os.environ.get("STRM_FORCE", "0") == "1"
+PRUNE = os.environ.get("STRM_PRUNE", "1") == "1"
 PAGE_SIZE = int(os.environ.get("STRM_PAGE", "200"))
 
 VIDEO_EXT = {
@@ -36,7 +43,10 @@ VIDEO_EXT = {
     ".asf", ".f4v", ".vob", ".rm", ".divx", ".ogv",
 }
 
-STAT = {"dirs": 0, "files": 0, "strm": 0, "skip": 0, "err": 0}
+STAT = {"dirs": 0, "files": 0, "strm": 0, "skip": 0, "err": 0, "pruned": 0, "rmdir": 0}
+EXPECTED = set()     # 本轮应当存在的 .strm 绝对路径
+BAD_DIRS = set()     # 列目录失败的子树，清理时整体跳过
+SRC_BAD = 0          # 源目录本身不可用的次数
 
 
 def log(*a):
@@ -94,6 +104,7 @@ def build_url(path, sign):
 def write_strm(out_dir, name, url):
     stem = os.path.splitext(name)[0]
     dst = os.path.join(out_dir, stem + ".strm")
+    EXPECTED.add(os.path.normpath(dst))
     if not FORCE and os.path.exists(dst):
         try:
             with open(dst, "r", encoding="utf-8") as f:
@@ -108,7 +119,8 @@ def write_strm(out_dir, name, url):
     STAT["strm"] += 1
 
 
-def walk(token, path, out_dir):
+def walk(token, path, out_dir, top=False):
+    global SRC_BAD
     page = 1
     while True:
         d = call("/api/fs/list", {
@@ -118,6 +130,9 @@ def walk(token, path, out_dir):
         if d.get("code") != 200:
             log("  ! 列目录失败", path, d.get("message"))
             STAT["err"] += 1
+            if top:
+                SRC_BAD += 1
+            BAD_DIRS.add(os.path.normpath(out_dir))
             return
         data = d.get("data") or {}
         items = data.get("content") or []
@@ -140,6 +155,10 @@ def walk(token, path, out_dir):
                 except Exception as e:
                     STAT["err"] += 1
                     log("  ! 失败", name, e)
+                    # 取 sign 失败时保留旧 strm，避免清理阶段把它误删
+                    old = os.path.join(out_dir, os.path.splitext(name)[0] + ".strm")
+                    if os.path.exists(old):
+                        EXPECTED.add(os.path.normpath(old))
                 if STAT["files"] % 50 == 0:
                     log("  进度: %d 文件 / %d 目录, 生成 %d, 跳过 %d" % (
                         STAT["files"], STAT["dirs"], STAT["strm"], STAT["skip"]))
@@ -148,19 +167,71 @@ def walk(token, path, out_dir):
         page += 1
 
 
+def _under_bad(p):
+    for b in BAD_DIRS:
+        if p == b or p.startswith(b + os.sep):
+            return True
+    return False
+
+
+def prune(out):
+    """删除本轮未出现的 .strm 文件，以及因此变空的目录。"""
+    out = os.path.normpath(out)
+    for root, dirs, files in os.walk(out, topdown=False):
+        root_n = os.path.normpath(root)
+        for f in files:
+            if not f.lower().endswith(".strm"):
+                continue
+            p = os.path.normpath(os.path.join(root, f))
+            if p in EXPECTED:
+                continue
+            if _under_bad(p):
+                continue
+            try:
+                os.remove(p)
+                STAT["pruned"] += 1
+            except Exception as e:
+                log("  ! 删除失败", p, e)
+        if root_n == out:
+            continue
+        if _under_bad(root_n):
+            continue
+        try:
+            if not os.listdir(root_n):
+                os.rmdir(root_n)
+                STAT["rmdir"] += 1
+        except Exception:
+            pass
+
+
 def main():
     if not PASS:
         raise SystemExit("缺少 OL_PASS")
     log("=== STRM 生成开始 ===")
-    log("源: %s  ->  输出: %s  (force=%s)" % (SRC, OUT, FORCE))
+    log("源: %s  ->  输出: %s  (force=%s, prune=%s)" % (", ".join(SRCS), OUT, FORCE, PRUNE))
     token = login()
     os.makedirs(OUT, exist_ok=True)
     t0 = time.time()
-    walk(token, SRC, OUT)
+    for i, src in enumerate(SRCS):
+        if i:
+            log("--- 切换到下一个源: %s" % src)
+        walk(token, src, OUT, top=True)
     log("=== 完成 ===")
     log("目录 %d | 视频文件 %d | 生成 %d | 跳过 %d | 失败 %d | 耗时 %.1fs" % (
         STAT["dirs"], STAT["files"], STAT["strm"], STAT["skip"],
         STAT["err"], time.time() - t0))
+
+    if PRUNE:
+        if SRC_BAD > 0:
+            log("!! %d 个源目录不可用，为保证安全跳过清理（请检查 STRM_SRC）" % SRC_BAD)
+        else:
+            log("开始清理本轮未出现的旧 .strm …")
+            prune(OUT)
+            log("清理完成: 删除 %d 个 .strm，%d 个空目录" % (STAT["pruned"], STAT["rmdir"]))
+            if STAT["err"]:
+                log("   注：本轮有 %d 处失败，相关子树与文件已跳过清理" % STAT["err"])
+    else:
+        log("清理已关闭（STRM_PRUNE=0）")
 
 
 if __name__ == "__main__":
