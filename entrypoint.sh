@@ -64,9 +64,13 @@ if [ -n "${ADMIN_PASSWORD_HASH:-}" ]; then
     N=$(psql -h 127.0.0.1 -p "$PGPORT" -U postgres -d "$DB_NAME" -tAc \
         "SELECT count(*) FROM users" 2>/dev/null | tr -d ' ')
     if [ "${N:-0}" -gt 0 ]; then
-      psql -h 127.0.0.1 -p "$PGPORT" -U postgres -d "$DB_NAME" -q -v ON_ERROR_STOP=1 \
-        -c "UPDATE users SET password='${ADMIN_PASSWORD_HASH}' WHERE username='admin'" >/dev/null 2>&1 \
-        && log "已重置 admin 密码（users=$N）" || log "!! 重置 admin 密码失败"
+      ERR=$(psql -h 127.0.0.1 -p "$PGPORT" -U postgres -d "$DB_NAME" -q -v ON_ERROR_STOP=1 \
+        -c "UPDATE users SET hash='${ADMIN_PASSWORD_HASH}' WHERE name='admin'" 2>&1)
+      if [ $? -eq 0 ]; then
+        log "已重置 admin 密码（users=$N）"
+      else
+        log "!! 重置 admin 密码失败: $ERR"
+      fi
     else
       log "users 表为空，交由 go-emby 用 ADMIN_PASSWORD 建号"
     fi
