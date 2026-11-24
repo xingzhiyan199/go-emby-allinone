@@ -43,7 +43,7 @@ VIDEO_EXT = {
     ".asf", ".f4v", ".vob", ".rm", ".divx", ".ogv",
 }
 
-STAT = {"dirs": 0, "files": 0, "strm": 0, "skip": 0, "err": 0, "pruned": 0, "rmdir": 0}
+STAT = {"dirs": 0, "files": 0, "strm": 0, "skip": 0, "fast": 0, "err": 0, "pruned": 0, "rmdir": 0}
 EXPECTED = set()     # 本轮应当存在的 .strm 绝对路径
 BAD_DIRS = set()     # 列目录失败的子树，清理时整体跳过
 SRC_BAD = 0          # 源目录本身不可用的次数
@@ -101,6 +101,33 @@ def build_url(path, sign):
     return u
 
 
+def url_path_of(dst):
+    """读出已有 strm 里的源路径（解码后），用于判断是否需要重新取 sign。"""
+    try:
+        with open(dst, "r", encoding="utf-8") as f:
+            c = f.read().strip()
+    except Exception:
+        return None
+    i = c.find("/d/")
+    if i < 0:
+        return None
+    rest = c[i + 2:]
+    j = rest.find("?")
+    if j >= 0:
+        rest = rest[:j]
+    try:
+        return urllib.parse.unquote(rest)
+    except Exception:
+        return rest
+
+
+def sign_still_valid(dst, path):
+    """strm 已存在且指向同一源路径 → 说明 sign 未变（OpenList 的 sign 带 :0 表示不过期）。"""
+    if not os.path.exists(dst):
+        return False
+    return url_path_of(dst) == path
+
+
 def write_strm(out_dir, name, url):
     stem = os.path.splitext(name)[0]
     dst = os.path.join(out_dir, stem + ".strm")
@@ -148,20 +175,26 @@ def walk(token, path, out_dir, top=False):
                 if ext not in VIDEO_EXT:
                     continue
                 STAT["files"] += 1
-                try:
-                    g = call("/api/fs/get", {"path": child, "password": ""}, token)
-                    sign = ((g.get("data") or {}).get("sign") or "").strip()
-                    write_strm(out_dir, name, build_url(child, sign))
-                except Exception as e:
-                    STAT["err"] += 1
-                    log("  ! 失败", name, e)
-                    # 取 sign 失败时保留旧 strm，避免清理阶段把它误删
-                    old = os.path.join(out_dir, os.path.splitext(name)[0] + ".strm")
-                    if os.path.exists(old):
-                        EXPECTED.add(os.path.normpath(old))
+                dst = os.path.join(out_dir, os.path.splitext(name)[0] + ".strm")
+                # 快速路径：本地 strm 已指向同一源路径 → sign 未变，直接跳过，省一次 fs/get
+                if not FORCE and sign_still_valid(dst, child):
+                    EXPECTED.add(os.path.normpath(dst))
+                    STAT["fast"] += 1
+                    STAT["skip"] += 1
+                else:
+                    try:
+                        g = call("/api/fs/get", {"path": child, "password": ""}, token)
+                        sign = ((g.get("data") or {}).get("sign") or "").strip()
+                        write_strm(out_dir, name, build_url(child, sign))
+                    except Exception as e:
+                        STAT["err"] += 1
+                        log("  ! 失败", name, e)
+                        # 取 sign 失败时保留旧 strm，避免清理阶段把它误删
+                        if os.path.exists(dst):
+                            EXPECTED.add(os.path.normpath(dst))
                 if STAT["files"] % 50 == 0:
-                    log("  进度: %d 文件 / %d 目录, 生成 %d, 跳过 %d" % (
-                        STAT["files"], STAT["dirs"], STAT["strm"], STAT["skip"]))
+                    log("  进度: %d 文件 / %d 目录, 生成 %d, 跳过 %d(其中免查 %d)" % (
+                        STAT["files"], STAT["dirs"], STAT["strm"], STAT["skip"], STAT["fast"]))
         if page * PAGE_SIZE >= total or not items:
             return
         page += 1
@@ -217,8 +250,8 @@ def main():
             log("--- 切换到下一个源: %s" % src)
         walk(token, src, OUT, top=True)
     log("=== 完成 ===")
-    log("目录 %d | 视频文件 %d | 生成 %d | 跳过 %d | 失败 %d | 耗时 %.1fs" % (
-        STAT["dirs"], STAT["files"], STAT["strm"], STAT["skip"],
+    log("目录 %d | 视频文件 %d | 生成 %d | 跳过 %d (免查 %d) | 失败 %d | 耗时 %.1fs" % (
+        STAT["dirs"], STAT["files"], STAT["strm"], STAT["skip"], STAT["fast"],
         STAT["err"], time.time() - t0))
 
     if PRUNE:
